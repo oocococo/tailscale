@@ -31,8 +31,8 @@ main() {
 		#  - VERSION_CODENAME: the codename of the OS release, if any (e.g. "buster")
 		. /etc/os-release
 		case "$ID" in
-			ubuntu)
-				OS="$ID"
+			ubuntu|pop|neon)
+				OS="ubuntu"
 				VERSION="$VERSION_CODENAME"
 				PACKAGETYPE="apt"
 				;;
@@ -61,7 +61,7 @@ main() {
 				;;
 			fedora)
 				OS="$ID"
-				VERSION=""
+				VERSION="$VERSION_ID"
 				PACKAGETYPE="dnf"
 				;;
 			amzn)
@@ -189,6 +189,13 @@ main() {
 				OS_UNSUPPORTED=1
 			fi
 		;;
+		fedora)
+			if [ "$VERSION" != "34" ] && \
+			   [ "$VERSION" != "35" ]
+			then
+				OS_UNSUPPORTED=1
+			fi
+		;;
 		rhel)
 			if [ "$VERSION" != "8" ]
 			then
@@ -204,6 +211,7 @@ main() {
 		opensuse)
 			if [ "$VERSION" != "leap/15.1" ] && \
 			   [ "$VERSION" != "leap/15.2" ] && \
+			   [ "$VERSION" != "leap/15.3" ] && \
 			   [ "$VERSION" != "tumbleweed" ]
 			then
 				OS_UNSUPPORTED=1

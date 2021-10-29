@@ -8,6 +8,7 @@ import (
 	"io"
 	"sort"
 
+	"github.com/go-multierror/multierror"
 	"golang.zx2c4.com/wireguard/device"
 	"tailscale.com/types/logger"
 )
@@ -19,12 +20,10 @@ func DeviceConfig(d *device.Device) (*Config, error) {
 		errc <- d.IpcGetOperation(w)
 		w.Close()
 	}()
-	cfg, err := FromUAPI(r)
-	// Prefer errors from IpcGetOperation.
-	if setErr := <-errc; setErr != nil {
-		return nil, setErr
-	}
-	// Check FromUAPI error.
+	cfg, fromErr := FromUAPI(r)
+	r.Close()
+	getErr := <-errc
+	err := multierror.Of(getErr, fromErr)
 	if err != nil {
 		return nil, err
 	}
@@ -51,14 +50,11 @@ func ReconfigDevice(d *device.Device, cfg *Config, logf logger.Logf) (err error)
 	errc := make(chan error, 1)
 	go func() {
 		errc <- d.IpcSetOperation(r)
-		w.Close()
+		r.Close()
 	}()
 
-	err = cfg.ToUAPI(w, prev)
+	toErr := cfg.ToUAPI(w, prev)
 	w.Close()
-	// Prefer errors from IpcSetOperation.
-	if setErr := <-errc; setErr != nil {
-		return setErr
-	}
-	return err // err (if any) from cfg.ToUAPI
+	setErr := <-errc
+	return multierror.Of(setErr, toErr)
 }

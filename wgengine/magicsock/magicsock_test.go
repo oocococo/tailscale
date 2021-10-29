@@ -24,6 +24,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/go-multierror/multierror"
 	"go4.org/mem"
 	"golang.org/x/crypto/nacl/box"
 	"golang.zx2c4.com/wireguard/device"
@@ -296,9 +297,18 @@ func meshStacks(logf logger.Logf, mutateNetmap func(idx int, nm *netmap.NetworkM
 				panic(fmt.Sprintf("failed to construct wgcfg from netmap: %v", err))
 			}
 			if err := m.Reconfig(wg); err != nil {
-				if ctx.Err() != nil || errors.Is(err, errConnClosed) {
+				if ctx.Err() != nil {
 					// shutdown race, don't care.
 					return
+				}
+				var me multierror.MultipleErrors
+				if errors.As(err, &me) {
+					for _, e := range me {
+						if errors.Is(e, errConnClosed) {
+							// shutdown race, don't care.
+							return
+						}
+					}
 				}
 				panic(fmt.Sprintf("device reconfig failed: %v", err))
 			}

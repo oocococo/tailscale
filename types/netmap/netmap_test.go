@@ -8,24 +8,30 @@ import (
 	"encoding/hex"
 	"testing"
 
+	"go4.org/mem"
 	"inet.af/netaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 )
 
-func testNodeKey(b byte) (ret tailcfg.NodeKey) {
-	for i := range ret {
-		ret[i] = b
+func testNodeKey(b byte) (ret key.NodePublic) {
+	var bs [key.NodePublicRawLen]byte
+	for i := range bs {
+		bs[i] = b
 	}
-	return
+	return key.NodePublicFromRaw32(mem.B(bs[:]))
 }
 
-func testDiscoKey(hexPrefix string) (ret tailcfg.DiscoKey) {
+func testDiscoKey(hexPrefix string) (ret key.DiscoPublic) {
 	b, err := hex.DecodeString(hexPrefix)
 	if err != nil {
 		panic(err)
 	}
-	copy(ret[:], b)
-	return
+	// this function is used with short hexes, so zero-extend the raw
+	// value.
+	var bs [32]byte
+	copy(bs[:], b)
+	return key.DiscoPublicFromRaw32(mem.B(bs[:]))
 }
 
 func TestNetworkMapConcise(t *testing.T) {

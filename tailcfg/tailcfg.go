@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"go4.org/mem"
 	"inet.af/netaddr"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
@@ -48,7 +47,8 @@ import (
 //    22: 2021-06-16: added MapResponse.DNSConfig.ExtraRecords
 //    23: 2021-08-25: DNSConfig.Routes values may be empty (for ExtraRecords support in 1.14.1+)
 //    24: 2021-09-18: MapResponse.Health from control to node; node shows in "tailscale status"
-const CurrentMapRequestVersion = 24
+//    25: 2021-11-01: MapResponse.Debug.Exit
+const CurrentMapRequestVersion = 25
 
 type StableID string
 
@@ -76,25 +76,6 @@ type StableNodeID StableID
 
 func (u StableNodeID) IsZero() bool {
 	return u == ""
-}
-
-// NodeKey is the WireGuard public key for a node.
-//
-// Deprecated: prefer to use key.NodePublic instead. If you must have
-// a NodeKey, use NodePublic.AsNodeKey.
-type NodeKey = key.NodeKey
-
-// DiscoKey is the curve25519 public key for path discovery key.
-// It's never written to disk or reused between network start-ups.
-type DiscoKey [32]byte
-
-// DiscoKeyFromNodePublic returns k converted to a DiscoKey.
-//
-// Deprecated: exists only as a compatibility bridge while DiscoKey
-// gets removed from the codebase. Do not introduce new uses that
-// aren't related to #3206.
-func DiscoKeyFromDiscoPublic(k key.DiscoPublic) DiscoKey {
-	return k.Raw32()
 }
 
 // User is an IPN user.
@@ -165,10 +146,10 @@ type Node struct {
 	// Sharer, if non-zero, is the user who shared this node, if different than User.
 	Sharer UserID `json:",omitempty"`
 
-	Key        NodeKey
+	Key        key.NodePublic
 	KeyExpiry  time.Time
 	Machine    key.MachinePublic
-	DiscoKey   DiscoKey
+	DiscoKey   key.DiscoPublic
 	Addresses  []netaddr.IPPrefix // IP addresses of this Node directly
 	AllowedIPs []netaddr.IPPrefix // range of IP addresses to route to this node
 	Endpoints  []string           `json:",omitempty"` // IP+port (public via STUN, and local LANs)
@@ -637,8 +618,8 @@ func (st SignatureType) String() string {
 type RegisterRequest struct {
 	_          structs.Incomparable
 	Version    int // currently 1
-	NodeKey    NodeKey
-	OldNodeKey NodeKey
+	NodeKey    key.NodePublic
+	OldNodeKey key.NodePublic
 	Auth       struct {
 		_ structs.Incomparable
 		// One of Provider/LoginName, Oauth2Token, or AuthKey is set.
@@ -755,8 +736,8 @@ type MapRequest struct {
 
 	Compress    string // "zstd" or "" (no compression)
 	KeepAlive   bool   // whether server should send keep-alives back to us
-	NodeKey     NodeKey
-	DiscoKey    DiscoKey
+	NodeKey     key.NodePublic
+	DiscoKey    key.DiscoPublic
 	IncludeIPv6 bool `json:",omitempty"` // include IPv6 endpoints in returned Node Endpoints (for Version 4 clients)
 	Stream      bool // if true, multiple MapResponse objects are returned
 	Hostinfo    *Hostinfo
@@ -1119,12 +1100,16 @@ type Debug struct {
 	// fixed port.
 	RandomizeClientPort bool `json:",omitempty"`
 
-	/// DisableUPnP is whether the client will attempt to perform a UPnP portmapping.
+	// DisableUPnP is whether the client will attempt to perform a UPnP portmapping.
 	// By default, we want to enable it to see if it works on more clients.
 	//
 	// If UPnP catastrophically fails for people, this should be set to True to kill
 	// new attempts at UPnP connections.
 	DisableUPnP opt.Bool `json:",omitempty"`
+
+	// Exit optionally specifies that the client should os.Exit
+	// with this code.
+	Exit *int `json:",omitempty"`
 }
 
 func appendKey(base []byte, prefix string, k [32]byte) []byte {
@@ -1138,25 +1123,6 @@ func appendKey(base []byte, prefix string, k [32]byte) []byte {
 func keyMarshalText(prefix string, k [32]byte) []byte {
 	return appendKey(nil, prefix, k)
 }
-
-func (k DiscoKey) String() string { return fmt.Sprintf("discokey:%x", k[:]) }
-func (k DiscoKey) MarshalText() ([]byte, error) {
-	dk := key.DiscoPublicFromRaw32(mem.B(k[:]))
-	return dk.MarshalText()
-}
-func (k *DiscoKey) UnmarshalText(text []byte) error {
-	var dk key.DiscoPublic
-	if err := dk.UnmarshalText(text); err != nil {
-		return err
-	}
-	dk.AppendTo(k[:0])
-	return nil
-}
-func (k DiscoKey) ShortString() string      { return fmt.Sprintf("d:%x", k[:8]) }
-func (k DiscoKey) AppendTo(b []byte) []byte { return appendKey(b, "discokey:", k) }
-
-// IsZero reports whether k is the zero value.
-func (k DiscoKey) IsZero() bool { return k == DiscoKey{} }
 
 func (id ID) String() string      { return fmt.Sprintf("id:%x", int64(id)) }
 func (id UserID) String() string  { return fmt.Sprintf("userid:%x", int64(id)) }
@@ -1279,7 +1245,7 @@ type SetDNSRequest struct {
 	Version int
 
 	// NodeKey is the client's current node key.
-	NodeKey NodeKey
+	NodeKey key.NodePublic
 
 	// Name is the domain name for which to create a record.
 	// For ACME DNS-01 challenges, it should be one of the domains

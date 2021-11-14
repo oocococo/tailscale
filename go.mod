@@ -4,6 +4,7 @@ go 1.17
 
 require (
 	filippo.io/mkcert v1.4.3
+	github.com/akutz/memconn v0.1.0
 	github.com/alexbrainman/sspi v0.0.0-20210105120005-909beea2cc74
 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect
 	github.com/aws/aws-sdk-go v1.38.52
@@ -13,9 +14,8 @@ require (
 	github.com/coreos/go-iptables v0.6.0
 	github.com/creack/pty v1.1.17
 	github.com/dave/jennifer v1.4.1
-	github.com/frankban/quicktest v1.13.1
+	github.com/frankban/quicktest v1.14.0
 	github.com/gliderlabs/ssh v0.3.3
-	github.com/go-multierror/multierror v1.0.2
 	github.com/go-ole/go-ole v1.2.6-0.20210915003542-8b1f7f90f6b1
 	github.com/godbus/dbus/v5 v5.0.5
 	github.com/google/go-cmp v0.5.6
@@ -39,10 +39,11 @@ require (
 	github.com/tailscale/goexpect v0.0.0-20210902213824-6e8c725cea41
 	github.com/tailscale/goupnp v1.0.1-0.20210804011211-c64d0f06ea05
 	github.com/tailscale/hujson v0.0.0-20200924210142-dde312d0d6a2
+	github.com/tailscale/netlink v1.1.1-0.20211101221916-cabfb018fe85
 	github.com/tcnksm/go-httpstat v0.2.0
 	github.com/toqueteos/webbrowser v1.2.0
 	github.com/ulikunitz/xz v0.5.10 // indirect
-	github.com/vishvananda/netlink v1.1.0
+	github.com/vishvananda/netlink v1.1.1-0.20211101163509-b10eb8fe5cf6
 	go4.org/mem v0.0.0-20201119185036-c04c5a6ff174
 	golang.org/x/crypto v0.0.0-20210921155107-089bfa567519
 	golang.org/x/net v0.0.0-20211020060615-d418f374d309
@@ -55,7 +56,7 @@ require (
 	golang.zx2c4.com/wireguard/windows v0.4.10
 	honnef.co/go/tools v0.2.1
 	inet.af/netaddr v0.0.0-20211027220019-c74959edd3b6
-	inet.af/netstack v0.0.0-20211027215559-ec21145de76b
+	inet.af/netstack v0.0.0-20211101182044-1c1bcf452982
 	inet.af/peercred v0.0.0-20210318190834-4259e17bb763
 	inet.af/wf v0.0.0-20210516214145-a5343001b756
 	nhooyr.io/websocket v1.8.7
@@ -192,7 +193,7 @@ require (
 	github.com/ultraware/funlen v0.0.3 // indirect
 	github.com/ultraware/whitespace v0.0.4 // indirect
 	github.com/uudashr/gocognit v1.0.1 // indirect
-	github.com/vishvananda/netns v0.0.0-20191106174202-0a2b9b5464df // indirect
+	github.com/vishvananda/netns v0.0.0-20200728191858-db3c7e526aae // indirect
 	github.com/xanzy/ssh-agent v0.3.0 // indirect
 	go4.org/intern v0.0.0-20211027215823-ae77deb06f29 // indirect
 	go4.org/unsafe/assume-no-moving-gc v0.0.0-20211027215541-db492cf91b37 // indirect

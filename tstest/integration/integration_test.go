@@ -84,6 +84,47 @@ func TestOneNodeUp_NoAuth(t *testing.T) {
 	t.Logf("number of HTTP logcatcher requests: %v", env.LogCatcher.numRequests())
 }
 
+func TestOneNodeExpiredKey(t *testing.T) {
+	t.Parallel()
+	bins := BuildTestBinaries(t)
+
+	env := newTestEnv(t, bins)
+	defer env.Close()
+
+	n1 := newTestNode(t, env)
+
+	d1 := n1.StartDaemon(t)
+	defer d1.Kill()
+	n1.AwaitResponding(t)
+	n1.MustUp()
+	n1.AwaitRunning(t)
+
+	nodes := env.Control.AllNodes()
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d nodes", len(nodes))
+	}
+
+	nodeKey := nodes[0].Key
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := env.Control.AwaitNodeInMapRequest(ctx, nodeKey); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	env.Control.SetExpireAllNodes(true)
+	n1.AwaitNeedsLogin(t)
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	if err := env.Control.AwaitNodeInMapRequest(ctx, nodeKey); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	env.Control.SetExpireAllNodes(false)
+	n1.AwaitRunning(t)
+
+	d1.MustCleanShutdown(t)
+}
+
 func TestCollectPanic(t *testing.T) {
 	t.Parallel()
 	bins := BuildTestBinaries(t)
@@ -315,7 +356,7 @@ func TestAddPingRequest(t *testing.T) {
 		t.Fatalf("expected 1 node, got %d nodes", len(nodes))
 	}
 
-	nodeKey := nodes[0].Key.AsNodePublic()
+	nodeKey := nodes[0].Key
 
 	// Check that we get at least one ping reply after 10 tries.
 	for try := 1; try <= 10; try++ {
@@ -713,7 +754,7 @@ func (n *testNode) MustDown() {
 // over its localhost IPC mechanism. (Unix socket, etc)
 func (n *testNode) AwaitListening(t testing.TB) {
 	if err := tstest.WaitFor(20*time.Second, func() (err error) {
-		c, err := safesocket.Connect(n.sockFile, 41112)
+		c, err := safesocket.Connect(n.sockFile, safesocket.WindowsLocalPort)
 		if err != nil {
 			return err
 		}
@@ -777,6 +818,23 @@ func (n *testNode) AwaitRunning(t testing.TB) {
 		return nil
 	}); err != nil {
 		t.Fatalf("failure/timeout waiting for transition to Running status: %v", err)
+	}
+}
+
+// AwaitNeedsLogin waits for n to reach the IPN state "NeedsLogin".
+func (n *testNode) AwaitNeedsLogin(t testing.TB) {
+	t.Helper()
+	if err := tstest.WaitFor(20*time.Second, func() error {
+		st, err := n.Status()
+		if err != nil {
+			return err
+		}
+		if st.BackendState != "NeedsLogin" {
+			return fmt.Errorf("in state %q", st.BackendState)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("failure/timeout waiting for transition to NeedsLogin status: %v", err)
 	}
 }
 

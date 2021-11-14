@@ -33,6 +33,7 @@ import (
 	"tailscale.com/logpolicy"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/tstun"
+	"tailscale.com/safesocket"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/winutil"
 	"tailscale.com/version"
@@ -202,9 +203,14 @@ func startIPNServer(ctx context.Context, logid string) error {
 			dev.Close()
 			return nil, fmt.Errorf("engine: %w", err)
 		}
-		onlySubnets := true
-		if wrapNetstack {
-			mustStartNetstack(logf, eng, onlySubnets)
+		ns, err := newNetstack(logf, eng)
+		if err != nil {
+			return nil, fmt.Errorf("newNetstack: %w", err)
+		}
+		ns.ProcessLocalIPs = false
+		ns.ProcessSubnets = wrapNetstack
+		if err := ns.Start(); err != nil {
+			return nil, fmt.Errorf("failed to start netstack: %w", err)
 		}
 		return wgengine.NewWatchdog(eng), nil
 	}
@@ -266,7 +272,18 @@ func startIPNServer(ctx context.Context, logid string) error {
 			return nil, fmt.Errorf("%w\n\nlogid: %v", res.Err, logid)
 		}
 	}
-	err := ipnserver.Run(ctx, logf, logid, getEngine, ipnServerOpts())
+
+	store, err := ipnserver.StateStore(statePathOrDefault(), logf)
+	if err != nil {
+		return err
+	}
+
+	ln, _, err := safesocket.Listen(args.socketpath, safesocket.WindowsLocalPort)
+	if err != nil {
+		return fmt.Errorf("safesocket.Listen: %v", err)
+	}
+
+	err = ipnserver.Run(ctx, logf, ln, store, logid, getEngine, ipnServerOpts())
 	if err != nil {
 		logf("ipnserver.Run: %v", err)
 	}

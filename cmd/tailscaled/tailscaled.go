@@ -20,6 +20,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -27,7 +28,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-multierror/multierror"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnserver"
 	"tailscale.com/logpolicy"
@@ -36,8 +36,10 @@ import (
 	"tailscale.com/net/socks5/tssocks"
 	"tailscale.com/net/tstun"
 	"tailscale.com/paths"
+	"tailscale.com/safesocket"
 	"tailscale.com/types/flagtype"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/multierr"
 	"tailscale.com/util/osshare"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
@@ -78,6 +80,7 @@ var args struct {
 	debug          string
 	port           uint16
 	statepath      string
+	statedir       string
 	socketpath     string
 	birdSocketPath string
 	verbose        int
@@ -114,7 +117,8 @@ func main() {
 	flag.StringVar(&args.httpProxyAddr, "outbound-http-proxy-listen", "", `optional [ip]:port to run an outbound HTTP proxy (e.g. "localhost:8080")`)
 	flag.StringVar(&args.tunname, "tun", defaultTunName(), `tunnel interface name; use "userspace-networking" (beta) to not use TUN`)
 	flag.Var(flagtype.PortValue(&args.port, 0), "port", "UDP port to listen on for WireGuard and peer-to-peer traffic; 0 means automatically select")
-	flag.StringVar(&args.statepath, "state", paths.DefaultTailscaledStateFile(), "path of state file; use 'kube:<secret-name>' to use Kubernetes secrets or 'arn:aws:ssm:...' to store in AWS SSM")
+	flag.StringVar(&args.statepath, "state", paths.DefaultTailscaledStateFile(), "absolute path of state file; use 'kube:<secret-name>' to use Kubernetes secrets or 'arn:aws:ssm:...' to store in AWS SSM. If empty and --statedir is provided, the default is <statedir>/tailscaled.state")
+	flag.StringVar(&args.statedir, "statedir", "", "path to directory for storage of config state, TLS certs, temporary incoming Taildrop files, etc. If empty, it's derived from --state when possible.")
 	flag.StringVar(&args.socketpath, "socket", paths.DefaultTailscaledSocket(), "path of the service unix socket")
 	flag.StringVar(&args.birdSocketPath, "bird-socket", "", "path of the bird unix socket")
 	flag.BoolVar(&printVersion, "version", false, "print version information and exit")
@@ -202,6 +206,16 @@ func trySynologyMigration(p string) error {
 	return nil
 }
 
+func statePathOrDefault() string {
+	if args.statepath != "" {
+		return args.statepath
+	}
+	if args.statedir != "" {
+		return filepath.Join(args.statedir, "tailscaled.state")
+	}
+	return ""
+}
+
 func ipnServerOpts() (o ipnserver.Options) {
 	// Allow changing the OS-specific IPN behavior for tests
 	// so we can e.g. test Windows-specific behaviors on Linux.
@@ -210,9 +224,15 @@ func ipnServerOpts() (o ipnserver.Options) {
 		goos = runtime.GOOS
 	}
 
-	o.Port = 41112
-	o.StatePath = args.statepath
-	o.SocketPath = args.socketpath // even for goos=="windows", for tests
+	o.VarRoot = args.statedir
+
+	// If an absolute --state is provided but not --statedir, try to derive
+	// a state directory.
+	if o.VarRoot == "" && filepath.IsAbs(args.statepath) {
+		if dir := filepath.Dir(args.statepath); strings.EqualFold(filepath.Base(dir), "tailscale") {
+			o.VarRoot = dir
+		}
+	}
 
 	switch goos {
 	default:
@@ -261,10 +281,10 @@ func run() error {
 		return nil
 	}
 
-	if args.statepath == "" {
-		log.Fatalf("--state is required")
+	if args.statepath == "" && args.statedir == "" {
+		log.Fatalf("--statedir (or at least --state) is required")
 	}
-	if err := trySynologyMigration(args.statepath); err != nil {
+	if err := trySynologyMigration(statePathOrDefault()); err != nil {
 		log.Printf("error in synology migration: %v", err)
 	}
 
@@ -289,10 +309,14 @@ func run() error {
 		return err
 	}
 
-	var ns *netstack.Impl
-	if useNetstack || wrapNetstack {
-		onlySubnets := wrapNetstack && !useNetstack
-		ns = mustStartNetstack(logf, e, onlySubnets)
+	ns, err := newNetstack(logf, e)
+	if err != nil {
+		return fmt.Errorf("newNetstack: %w", err)
+	}
+	ns.ProcessLocalIPs = useNetstack
+	ns.ProcessSubnets = useNetstack || wrapNetstack
+	if err := ns.Start(); err != nil {
+		log.Fatalf("failed to start netstack: %v", err)
 	}
 
 	if socksListener != nil || httpProxyListener != nil {
@@ -332,8 +356,27 @@ func run() error {
 	}()
 
 	opts := ipnServerOpts()
-	opts.DebugMux = debugMux
-	err = ipnserver.Run(ctx, logf, pol.PublicID.String(), ipnserver.FixedEngine(e), opts)
+
+	store, err := ipnserver.StateStore(statePathOrDefault(), logf)
+	if err != nil {
+		return err
+	}
+	srv, err := ipnserver.New(logf, pol.PublicID.String(), store, e, nil, opts)
+	if err != nil {
+		logf("ipnserver.New: %v", err)
+		return err
+	}
+
+	if debugMux != nil {
+		debugMux.HandleFunc("/debug/ipn", srv.ServeHTMLStatus)
+	}
+
+	ln, _, err := safesocket.Listen(args.socketpath, safesocket.WindowsLocalPort)
+	if err != nil {
+		return fmt.Errorf("safesocket.Listen: %v", err)
+	}
+
+	err = srv.Run(ctx, ln)
 	// Cancelation is not an error: it is the only way to stop ipnserver.
 	if err != nil && err != context.Canceled {
 		logf("ipnserver.Run: %v", err)
@@ -357,7 +400,7 @@ func createEngine(logf logger.Logf, linkMon *monitor.Mon) (e wgengine.Engine, us
 		logf("wgengine.NewUserspaceEngine(tun %q) error: %v", name, err)
 		errs = append(errs, err)
 	}
-	return nil, false, multierror.New(errs)
+	return nil, false, multierr.New(errs...)
 }
 
 var wrapNetstack = shouldWrapNetstack()
@@ -453,19 +496,12 @@ func runDebugServer(mux *http.ServeMux, addr string) {
 	}
 }
 
-func mustStartNetstack(logf logger.Logf, e wgengine.Engine, onlySubnets bool) *netstack.Impl {
+func newNetstack(logf logger.Logf, e wgengine.Engine) (*netstack.Impl, error) {
 	tunDev, magicConn, ok := e.(wgengine.InternalsGetter).GetInternals()
 	if !ok {
-		log.Fatalf("%T is not a wgengine.InternalsGetter", e)
+		return nil, fmt.Errorf("%T is not a wgengine.InternalsGetter", e)
 	}
-	ns, err := netstack.Create(logf, tunDev, e, magicConn, onlySubnets)
-	if err != nil {
-		log.Fatalf("netstack.Create: %v", err)
-	}
-	if err := ns.Start(); err != nil {
-		log.Fatalf("failed to start netstack: %v", err)
-	}
-	return ns
+	return netstack.Create(logf, tunDev, e, magicConn)
 }
 
 func mustStartTCPListener(name, addr string) net.Listener {

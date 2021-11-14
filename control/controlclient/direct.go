@@ -60,7 +60,7 @@ type Direct struct {
 	keepAlive              bool
 	logf                   logger.Logf
 	linkMon                *monitor.Mon // or nil
-	discoPubKey            tailcfg.DiscoKey
+	discoPubKey            key.DiscoPublic
 	getMachinePrivKey      func() (key.MachinePrivate, error)
 	debugFlags             []string
 	keepSharerAndUserSplit bool
@@ -88,7 +88,7 @@ type Options struct {
 	AuthKey              string                             // optional node auth key for auto registration
 	TimeNow              func() time.Time                   // time.Now implementation used by Client
 	Hostinfo             *tailcfg.Hostinfo                  // non-nil passes ownership, nil means to use default using os.Hostname, etc
-	DiscoPublicKey       tailcfg.DiscoKey
+	DiscoPublicKey       key.DiscoPublic
 	NewDecompressor      func() (Decompressor, error)
 	KeepAlive            bool
 	Logf                 logger.Logf
@@ -146,6 +146,13 @@ func NewDirect(opts Options) (*Direct, error) {
 	}
 
 	httpc := opts.HTTPTestClient
+	if httpc == nil && runtime.GOOS == "js" {
+		// In js/wasm, net/http.Transport (as of Go 1.18) will
+		// only use the browser's Fetch API if you're using
+		// the DefaultClient (or a client without dial hooks
+		// etc set).
+		httpc = http.DefaultClient
+	}
 	if httpc == nil {
 		dnsCache := &dnscache.Resolver{
 			Forward:          dnscache.Get().Forward, // use default cache's forwarder
@@ -284,8 +291,8 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 	tryingNewKey := c.tryingNewKey
 	serverKey := c.serverKey
 	authKey := c.authKey
-	hostinfo := c.hostinfo.Clone()
-	backendLogID := hostinfo.BackendLogID
+	hi := c.hostinfo.Clone()
+	backendLogID := hi.BackendLogID
 	expired := c.expiry != nil && !c.expiry.IsZero() && c.expiry.Before(c.timeNow())
 	c.mu.Unlock()
 
@@ -357,9 +364,9 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 	now := time.Now().Round(time.Second)
 	request := tailcfg.RegisterRequest{
 		Version:    1,
-		OldNodeKey: oldNodeKey.AsNodeKey(),
-		NodeKey:    tryingNewKey.Public().AsNodeKey(),
-		Hostinfo:   hostinfo,
+		OldNodeKey: oldNodeKey,
+		NodeKey:    tryingNewKey.Public(),
+		Hostinfo:   hi,
 		Followup:   opt.URL,
 		Timestamp:  &now,
 		Ephemeral:  (opt.Flags & LoginEphemeral) != 0,
@@ -431,7 +438,7 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 		resp.NodeKeyExpired, resp.MachineAuthorized, resp.AuthURL != "")
 
 	if resp.Error != "" {
-		return false, "", errors.New(resp.Error)
+		return false, "", UserVisibleError(resp.Error)
 	}
 	if resp.NodeKeyExpired {
 		if regen {
@@ -555,8 +562,8 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 	persist := c.persist
 	serverURL := c.serverURL
 	serverKey := c.serverKey
-	hostinfo := c.hostinfo.Clone()
-	backendLogID := hostinfo.BackendLogID
+	hi := c.hostinfo.Clone()
+	backendLogID := hi.BackendLogID
 	localPort := c.localPort
 	var epStrs []string
 	var epTypes []tailcfg.EndpointType
@@ -595,18 +602,18 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 	request := &tailcfg.MapRequest{
 		Version:       tailcfg.CurrentMapRequestVersion,
 		KeepAlive:     c.keepAlive,
-		NodeKey:       persist.PrivateNodeKey.Public().AsNodeKey(),
+		NodeKey:       persist.PrivateNodeKey.Public(),
 		DiscoKey:      c.discoPubKey,
 		Endpoints:     epStrs,
 		EndpointTypes: epTypes,
 		Stream:        allowStream,
-		Hostinfo:      hostinfo,
+		Hostinfo:      hi,
 		DebugFlags:    c.debugFlags,
 		OmitPeers:     cb == nil,
 	}
 	var extraDebugFlags []string
-	if hostinfo != nil && c.linkMon != nil && !c.skipIPForwardingCheck &&
-		ipForwardingBroken(hostinfo.RoutableIPs, c.linkMon.InterfaceState()) {
+	if hi != nil && c.linkMon != nil && !c.skipIPForwardingCheck &&
+		ipForwardingBroken(hi.RoutableIPs, c.linkMon.InterfaceState()) {
 		extraDebugFlags = append(extraDebugFlags, "warn-ip-forwarding-off")
 	}
 	if health.RouterHealth() != nil {
@@ -614,6 +621,9 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 	}
 	if health.NetworkCategoryHealth() != nil {
 		extraDebugFlags = append(extraDebugFlags, "warn-network-category-unhealthy")
+	}
+	if hostinfo.DisabledEtcAptSource() {
+		extraDebugFlags = append(extraDebugFlags, "warn-etc-apt-source-disabled")
 	}
 	if len(extraDebugFlags) > 0 {
 		old := request.DebugFlags
@@ -765,6 +775,10 @@ func (c *Direct) sendMapRequest(ctx context.Context, maxPolls int, cb func(*netm
 		// being conservative here, if Debug not present set to False
 		controlknobs.SetDisableUPnP(hasDebug && resp.Debug.DisableUPnP.EqualBool(true))
 		if hasDebug {
+			if code := resp.Debug.Exit; code != nil {
+				c.logf("exiting process with status %v per controlplane", *code)
+				os.Exit(*code)
+			}
 			if resp.Debug.LogHeapPprof {
 				go logheap.LogHeap(resp.Debug.LogHeapURL)
 			}

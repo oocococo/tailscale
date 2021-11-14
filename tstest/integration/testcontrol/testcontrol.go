@@ -65,6 +65,7 @@ type Server struct {
 	authPath      map[string]*AuthPath
 	nodeKeyAuthed map[key.NodePublic]bool // key => true once authenticated
 	pingReqsToAdd map[key.NodePublic]*tailcfg.PingRequest
+	allExpired    bool // All nodes will be told their node key is expired.
 }
 
 // BaseURL returns the server's base URL, without trailing slash.
@@ -151,6 +152,18 @@ func (s *Server) AddPingRequest(nodeKeyDst key.NodePublic, pr *tailcfg.PingReque
 	nodeID := node.ID
 	oldUpdatesCh := s.updates[nodeID]
 	return sendUpdate(oldUpdatesCh, updateDebugInjection)
+}
+
+// Mark the Node key of every node as expired
+func (s *Server) SetExpireAllNodes(expired bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.allExpired = expired
+
+	for _, node := range s.nodes {
+		sendUpdate(s.updates[node.ID], updateSelfChanged)
+	}
 }
 
 type AuthPath struct {
@@ -276,7 +289,7 @@ func (s *Server) AddFakeNode() {
 	}
 	nk := key.NewNode().Public()
 	mk := key.NewMachine().Public()
-	dk := tailcfg.DiscoKeyFromDiscoPublic(key.NewDisco().Public())
+	dk := key.NewDisco().Public()
 	r := nk.Raw32()
 	id := int64(binary.LittleEndian.Uint64(r[:]))
 	ip := netaddr.IPv4(r[0], r[1], r[2], r[3])
@@ -286,7 +299,7 @@ func (s *Server) AddFakeNode() {
 		StableID:          tailcfg.StableNodeID(fmt.Sprintf("TESTCTRL%08x", id)),
 		User:              tailcfg.UserID(id),
 		Machine:           mk,
-		Key:               nk.AsNodeKey(),
+		Key:               nk,
 		MachineAuthorized: true,
 		DiscoKey:          dk,
 		Addresses:         []netaddr.IPPrefix{addr},
@@ -434,7 +447,7 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 		// some follow-ups? For now all are successes.
 	}
 
-	nk := req.NodeKey.AsNodePublic()
+	nk := req.NodeKey
 
 	user, login := s.getUser(nk)
 	s.mu.Lock()
@@ -467,6 +480,7 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 	if requireAuth && s.nodeKeyAuthed[nk] {
 		requireAuth = false
 	}
+	allExpired := s.allExpired
 	s.mu.Unlock()
 
 	authURL := ""
@@ -481,7 +495,7 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 	res, err := s.encode(mkey, false, tailcfg.RegisterResponse{
 		User:              *user,
 		Login:             *login,
-		NodeKeyExpired:    false,
+		NodeKeyExpired:    allExpired,
 		MachineAuthorized: machineAuthorized,
 		AuthURL:           authURL,
 	})
@@ -538,7 +552,7 @@ func (s *Server) UpdateNode(n *tailcfg.Node) (peersToUpdate []tailcfg.NodeID) {
 	if n.Key.IsZero() {
 		panic("zero nodekey")
 	}
-	s.nodes[n.Key.AsNodePublic()] = n.Clone()
+	s.nodes[n.Key] = n.Clone()
 	for _, n2 := range s.nodes {
 		if n.ID != n2.ID {
 			peersToUpdate = append(peersToUpdate, n2.ID)
@@ -581,7 +595,7 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 	jitter := time.Duration(rand.Intn(8000)) * time.Millisecond
 	keepAlive := 50*time.Second + jitter
 
-	node := s.Node(req.NodeKey.AsNodePublic())
+	node := s.Node(req.NodeKey)
 	if node == nil {
 		http.Error(w, "node not found", 400)
 		return
@@ -642,6 +656,13 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 		if res == nil {
 			return // done
 		}
+
+		s.mu.Lock()
+		allExpired := s.allExpired
+		s.mu.Unlock()
+		if allExpired {
+			res.Node.KeyExpiry = time.Now().Add(-1 * time.Minute)
+		}
 		// TODO: add minner if/when needed
 		resBytes, err := json.Marshal(res)
 		if err != nil {
@@ -693,7 +714,7 @@ var keepAliveMsg = &struct {
 //
 // No updates to s are done here.
 func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse, err error) {
-	nk := req.NodeKey.AsNodePublic()
+	nk := req.NodeKey
 	node := s.Node(nk)
 	if node == nil {
 		// node key rotated away (once test server supports that)

@@ -247,7 +247,7 @@ func meshStacks(logf logger.Logf, mutateNetmap func(idx int, nm *netmap.NetworkM
 		me := ms[myIdx]
 		nm := &netmap.NetworkMap{
 			PrivateKey: me.privateKey,
-			NodeKey:    me.privateKey.Public().AsNodeKey(),
+			NodeKey:    me.privateKey.Public(),
 			Addresses:  []netaddr.IPPrefix{netaddr.IPPrefixFrom(netaddr.IPv4(1, 0, 0, byte(myIdx+1)), 32)},
 		}
 		for i, peer := range ms {
@@ -258,8 +258,8 @@ func meshStacks(logf logger.Logf, mutateNetmap func(idx int, nm *netmap.NetworkM
 			peer := &tailcfg.Node{
 				ID:         tailcfg.NodeID(i + 1),
 				Name:       fmt.Sprintf("node%d", i+1),
-				Key:        peer.privateKey.Public().AsNodeKey(),
-				DiscoKey:   tailcfg.DiscoKeyFromDiscoPublic(peer.conn.DiscoPublicKey()),
+				Key:        peer.privateKey.Public(),
+				DiscoKey:   peer.conn.DiscoPublicKey(),
 				Addresses:  addrs,
 				AllowedIPs: addrs,
 				Endpoints:  epStrings(eps[i]),
@@ -285,7 +285,7 @@ func meshStacks(logf logger.Logf, mutateNetmap func(idx int, nm *netmap.NetworkM
 			m.conn.SetNetworkMap(nm)
 			peerSet := make(map[key.NodePublic]struct{}, len(nm.Peers))
 			for _, peer := range nm.Peers {
-				peerSet[key.NodePublicFromRaw32(mem.B(peer.Key[:]))] = struct{}{}
+				peerSet[peer.Key] = struct{}{}
 			}
 			m.conn.UpdatePeers(peerSet)
 			wg, err := nmcfg.WGCfg(nm, logf, netmap.AllowSingleHosts, "")
@@ -618,7 +618,7 @@ func TestNoDiscoKey(t *testing.T) {
 
 	removeDisco := func(idx int, nm *netmap.NetworkMap) {
 		for _, p := range nm.Peers {
-			p.DiscoKey = tailcfg.DiscoKey{}
+			p.DiscoKey = key.DiscoPublic{}
 		}
 	}
 
@@ -680,7 +680,7 @@ func TestDiscokeyChange(t *testing.T) {
 		}
 		mu.Lock()
 		defer mu.Unlock()
-		nm.Peers[0].DiscoKey = tailcfg.DiscoKeyFromDiscoPublic(m1DiscoKey)
+		nm.Peers[0].DiscoKey = m1DiscoKey
 	}
 
 	cleanupMesh := meshStacks(t.Logf, setm1Key, m1, m2)
@@ -1136,12 +1136,12 @@ func TestDiscoMessage(t *testing.T) {
 	peer1Pub := c.DiscoPublicKey()
 	peer1Priv := c.discoPrivate
 	n := &tailcfg.Node{
-		Key:      key.NewNode().Public().AsNodeKey(),
-		DiscoKey: tailcfg.DiscoKeyFromDiscoPublic(peer1Pub),
+		Key:      key.NewNode().Public(),
+		DiscoKey: peer1Pub,
 	}
 	c.peerMap.upsertEndpoint(&endpoint{
 		publicKey: n.Key,
-		discoKey:  key.DiscoPublicFromRaw32(mem.B(n.DiscoKey[:])),
+		discoKey:  n.DiscoKey,
 	})
 
 	const payload = "why hello"
@@ -1153,7 +1153,7 @@ func TestDiscoMessage(t *testing.T) {
 
 	box := peer1Priv.Shared(c.discoPrivate.Public()).Seal([]byte(payload))
 	pkt = append(pkt, box...)
-	got := c.handleDiscoMessage(pkt, netaddr.IPPort{}, tailcfg.NodeKey{})
+	got := c.handleDiscoMessage(pkt, netaddr.IPPort{}, key.NodePublic{})
 	if !got {
 		t.Error("failed to open it")
 	}
@@ -1184,7 +1184,7 @@ func Test32bitAlignment(t *testing.T) {
 	called := 0
 	de := endpoint{
 		c: &Conn{
-			noteRecvActivity: func(tailcfg.NodeKey) { called++ },
+			noteRecvActivity: func(key.NodePublic) { called++ },
 		},
 	}
 
@@ -1223,18 +1223,17 @@ func newTestConn(t testing.TB) *Conn {
 // addTestEndpoint sets conn's network map to a single peer expected
 // to receive packets from sendConn (or DERP), and returns that peer's
 // nodekey and discokey.
-func addTestEndpoint(tb testing.TB, conn *Conn, sendConn net.PacketConn) (tailcfg.NodeKey, key.DiscoPublic) {
+func addTestEndpoint(tb testing.TB, conn *Conn, sendConn net.PacketConn) (key.NodePublic, key.DiscoPublic) {
 	// Give conn just enough state that it'll recognize sendConn as a
 	// valid peer and not fall through to the legacy magicsock
 	// codepath.
 	discoKey := key.DiscoPublicFromRaw32(mem.B([]byte{31: 1}))
 	nodeKey := key.NodePublicFromRaw32(mem.B([]byte{0: 'N', 1: 'K', 31: 0}))
-	tnk := nodeKey.AsNodeKey()
 	conn.SetNetworkMap(&netmap.NetworkMap{
 		Peers: []*tailcfg.Node{
 			{
-				Key:       tnk,
-				DiscoKey:  tailcfg.DiscoKeyFromDiscoPublic(discoKey),
+				Key:       nodeKey,
+				DiscoKey:  discoKey,
 				Endpoints: []string{sendConn.LocalAddr().String()},
 			},
 		},
@@ -1244,8 +1243,8 @@ func addTestEndpoint(tb testing.TB, conn *Conn, sendConn net.PacketConn) (tailcf
 	if err != nil {
 		tb.Fatal(err)
 	}
-	conn.addValidDiscoPathForTest(tnk, netaddr.MustParseIPPort(sendConn.LocalAddr().String()))
-	return tnk, discoKey
+	conn.addValidDiscoPathForTest(nodeKey, netaddr.MustParseIPPort(sendConn.LocalAddr().String()))
+	return nodeKey, discoKey
 }
 
 func setUpReceiveFrom(tb testing.TB) (roundTrip func()) {
@@ -1405,19 +1404,19 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 	conn.SetPrivateKey(key.NodePrivateFromRaw32(mem.B([]byte{0: 1, 31: 0})))
 
 	discoKey := key.DiscoPublicFromRaw32(mem.B([]byte{31: 1}))
-	nodeKey1 := tailcfg.NodeKey{0: 'N', 1: 'K', 2: '1'}
-	nodeKey2 := tailcfg.NodeKey{0: 'N', 1: 'K', 2: '2'}
+	nodeKey1 := key.NodePublicFromRaw32(mem.B([]byte{0: 'N', 1: 'K', 2: '1', 31: 0}))
+	nodeKey2 := key.NodePublicFromRaw32(mem.B([]byte{0: 'N', 1: 'K', 2: '2', 31: 0}))
 
 	conn.SetNetworkMap(&netmap.NetworkMap{
 		Peers: []*tailcfg.Node{
 			{
 				Key:       nodeKey1,
-				DiscoKey:  tailcfg.DiscoKeyFromDiscoPublic(discoKey),
+				DiscoKey:  discoKey,
 				Endpoints: []string{"192.168.1.2:345"},
 			},
 		},
 	})
-	_, err := conn.ParseEndpoint(key.NodePublicFromRaw32(mem.B(nodeKey1[:])).UntypedHexString())
+	_, err := conn.ParseEndpoint(nodeKey1.UntypedHexString())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1427,7 +1426,7 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 			Peers: []*tailcfg.Node{
 				{
 					Key:       nodeKey2,
-					DiscoKey:  tailcfg.DiscoKeyFromDiscoPublic(discoKey),
+					DiscoKey:  discoKey,
 					Endpoints: []string{"192.168.1.2:345"},
 				},
 			},
@@ -1436,7 +1435,7 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 
 	de, ok := conn.peerMap.endpointForNodeKey(nodeKey2)
 	if ok && de.publicKey != nodeKey2 {
-		t.Fatalf("discoEndpoint public key = %q; want %q", de.publicKey[:], nodeKey2[:])
+		t.Fatalf("discoEndpoint public key = %q; want %q", de.publicKey, nodeKey2)
 	}
 	if de.discoKey != discoKey {
 		t.Errorf("discoKey = %v; want %v", de.discoKey, discoKey)

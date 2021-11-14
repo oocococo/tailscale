@@ -25,8 +25,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-multierror/multierror"
-	"go4.org/mem"
 	"inet.af/netaddr"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/control/controlclient"
@@ -50,6 +48,7 @@ import (
 	"tailscale.com/types/preftype"
 	"tailscale.com/util/deephash"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/multierr"
 	"tailscale.com/util/osshare"
 	"tailscale.com/util/systemd"
 	"tailscale.com/version"
@@ -97,6 +96,7 @@ type LocalBackend struct {
 	gotPortPollRes        chan struct{}    // closed upon first readPoller result
 	serverURL             string           // tailcontrol URL
 	newDecompressor       func() (controlclient.Decompressor, error)
+	varRoot               string // or empty if SetVarRoot never called
 
 	filterHash deephash.Sum
 
@@ -122,6 +122,7 @@ type LocalBackend struct {
 	engineStatus     ipn.EngineStatus
 	endpoints        []tailcfg.Endpoint
 	blocked          bool
+	keyExpired       bool
 	authURL          string // cleared on Notify
 	authURLSticky    string // not cleared on Notify
 	interact         bool
@@ -335,8 +336,8 @@ func (b *LocalBackend) updateStatus(sb *ipnstate.StatusBuilder, extraLocked func
 
 		if err := health.OverallError(); err != nil {
 			switch e := err.(type) {
-			case multierror.MultipleErrors:
-				for _, err := range e {
+			case multierr.Error:
+				for _, err := range e.Errors() {
 					s.Health = append(s.Health, err.Error())
 				}
 			default:
@@ -389,7 +390,7 @@ func (b *LocalBackend) populatePeerStatusLocked(sb *ipnstate.StatusBuilder) {
 				tailscaleIPs = append(tailscaleIPs, addr.IP())
 			}
 		}
-		sb.AddPeer(key.NodePublicFromRaw32(mem.B(p.Key[:])), &ipnstate.PeerStatus{
+		sb.AddPeer(p.Key, &ipnstate.PeerStatus{
 			InNetworkMap:       true,
 			ID:                 p.StableID,
 			UserID:             p.User,
@@ -452,17 +453,34 @@ func (b *LocalBackend) setClientStatus(st controlclient.Status) {
 		// TODO(crawshaw): display in the UI.
 		if errors.Is(st.Err, io.EOF) {
 			b.logf("[v1] Received error: EOF")
-		} else {
-			b.logf("Received error: %v", st.Err)
-			e := st.Err.Error()
-			b.send(ipn.Notify{ErrMessage: &e})
+			return
+		}
+		b.logf("Received error: %v", st.Err)
+		var uerr controlclient.UserVisibleError
+		if errors.As(st.Err, &uerr) {
+			s := uerr.UserVisibleError()
+			b.send(ipn.Notify{ErrMessage: &s})
 		}
 		return
 	}
 
 	b.mu.Lock()
 	wasBlocked := b.blocked
+	keyExpiryExtended := false
+	if st.NetMap != nil {
+		wasExpired := b.keyExpired
+		isExpired := !st.NetMap.Expiry.IsZero() && st.NetMap.Expiry.Before(time.Now())
+		if wasExpired && !isExpired {
+			keyExpiryExtended = true
+		}
+		b.keyExpired = isExpired
+	}
 	b.mu.Unlock()
+
+	if keyExpiryExtended && wasBlocked {
+		// Key extended, unblock the engine
+		b.blockEngineUpdates(false)
+	}
 
 	if st.LoginFinished != nil && wasBlocked {
 		// Auth completed, unblock the engine
@@ -847,7 +865,7 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 		})
 	}
 
-	var discoPublic tailcfg.DiscoKey
+	var discoPublic key.DiscoPublic
 	if controlclient.Debug.Disco {
 		discoPublic = b.e.DiscoPublicKey()
 	}
@@ -1562,7 +1580,7 @@ func (b *LocalBackend) parseWgStatusLocked(s *wgengine.Status) (ret ipn.EngineSt
 	var peerStats, peerKeys strings.Builder
 
 	ret.LiveDERPs = s.DERPs
-	ret.LivePeers = map[tailcfg.NodeKey]ipnstate.PeerStatusLite{}
+	ret.LivePeers = map[key.NodePublic]ipnstate.PeerStatusLite{}
 	for _, p := range s.Peers {
 		if !p.LastHandshake.IsZero() {
 			fmt.Fprintf(&peerStats, "%d/%d ", p.RxBytes, p.TxBytes)
@@ -1769,6 +1787,12 @@ func (b *LocalBackend) NetMap() *netmap.NetworkMap {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.netMap
+}
+
+func (b *LocalBackend) isEngineBlocked() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.blocked
 }
 
 // blockEngineUpdate sets b.blocked to block, while holding b.mu. Its
@@ -1999,34 +2023,29 @@ func normalizeResolver(cfg dnstype.Resolver) dnstype.Resolver {
 	return cfg
 }
 
+// SetVarRoot sets the root directory of Tailscale's writable
+// storage area . (e.g. "/var/lib/tailscale")
+//
+// It should only be called before the LocalBackend is used.
+func (b *LocalBackend) SetVarRoot(dir string) {
+	b.varRoot = dir
+}
+
 // TailscaleVarRoot returns the root directory of Tailscale's writable
 // storage area. (e.g. "/var/lib/tailscale")
 //
 // It returns an empty string if there's no configured or discovered
 // location.
 func (b *LocalBackend) TailscaleVarRoot() string {
+	if b.varRoot != "" {
+		return b.varRoot
+	}
 	switch runtime.GOOS {
 	case "ios", "android":
 		dir, _ := paths.AppSharedDir.Load().(string)
 		return dir
 	}
-	// Temporary (2021-09-27) transitional fix for #2927 (Synology
-	// cert dir) on the way towards a more complete fix
-	// (#2932). It fixes any case where the state file is provided
-	// to tailscaled explicitly when it's not in the default
-	// location.
-	if fs, ok := b.store.(*ipn.FileStore); ok {
-		if fp := fs.Path(); fp != "" {
-			if dir := filepath.Dir(fp); strings.EqualFold(filepath.Base(dir), "tailscale") {
-				return dir
-			}
-		}
-	}
-	stateFile := paths.DefaultTailscaledStateFile()
-	if stateFile == "" {
-		return ""
-	}
-	return filepath.Dir(stateFile)
+	return ""
 }
 
 func (b *LocalBackend) fileRootLocked(uid tailcfg.UserID) string {
@@ -2398,6 +2417,7 @@ func (b *LocalBackend) nextState() ipn.State {
 		wantRunning = b.prefs.WantRunning
 		loggedOut   = b.prefs.LoggedOut
 		st          = b.engineStatus
+		keyExpired  = b.keyExpired
 	)
 	b.mu.Unlock()
 
@@ -2430,7 +2450,9 @@ func (b *LocalBackend) nextState() ipn.State {
 		}
 	case !wantRunning:
 		return ipn.Stopped
-	case !netMap.Expiry.IsZero() && time.Until(netMap.Expiry) <= 0:
+	case keyExpired:
+		// NetMap must be non-nil for us to get here.
+		// The node key expired, need to relogin.
 		return ipn.NeedsLogin
 	case netMap.MachineStatus != tailcfg.MachineAuthorized:
 		// TODO(crawshaw): handle tailcfg.MachineInvalid
@@ -2511,6 +2533,7 @@ func (b *LocalBackend) ResetForClientDisconnect() {
 	b.userID = ""
 	b.setNetMapLocked(nil)
 	b.prefs = new(ipn.Prefs)
+	b.keyExpired = false
 	b.authURL = ""
 	b.authURLSticky = ""
 	b.activeLogin = ""
@@ -2680,7 +2703,7 @@ func (b *LocalBackend) OperatorUserID() string {
 // TestOnlyPublicKeys returns the current machine and node public
 // keys. Used in tests only to facilitate automated node authorization
 // in the test harness.
-func (b *LocalBackend) TestOnlyPublicKeys() (machineKey key.MachinePublic, nodeKey tailcfg.NodeKey) {
+func (b *LocalBackend) TestOnlyPublicKeys() (machineKey key.MachinePublic, nodeKey key.NodePublic) {
 	b.mu.Lock()
 	prefs := b.prefs
 	machinePrivKey := b.machinePrivKey
@@ -2692,7 +2715,7 @@ func (b *LocalBackend) TestOnlyPublicKeys() (machineKey key.MachinePublic, nodeK
 
 	mk := machinePrivKey.Public()
 	nk := prefs.Persist.PrivateNodeKey.Public()
-	return mk, nk.AsNodeKey()
+	return mk, nk
 }
 
 func (b *LocalBackend) WaitingFiles() ([]apitype.WaitingFile, error) {
@@ -2782,7 +2805,7 @@ func (b *LocalBackend) SetDNS(ctx context.Context, name, value string) error {
 	b.mu.Lock()
 	cc := b.cc
 	if prefs := b.prefs; prefs != nil {
-		req.NodeKey = prefs.Persist.PrivateNodeKey.Public().AsNodeKey()
+		req.NodeKey = prefs.Persist.PrivateNodeKey.Public()
 	}
 	b.mu.Unlock()
 	if cc == nil {
